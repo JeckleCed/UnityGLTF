@@ -28,10 +28,24 @@ namespace GLTF.Schema
 		/// </summary>
 		public WrapMode WrapT = WrapMode.Repeat;
 
+		public Sampler()
+		{
+		}
+
+		public Sampler(Sampler sampler, GLTFRoot gltfRoot) : base(sampler, gltfRoot)
+		{
+			if (sampler == null) return;
+
+			MagFilter = sampler.MagFilter;
+			MinFilter = sampler.MinFilter;
+			WrapS = sampler.WrapS;
+			WrapT = sampler.WrapT;
+		}
+
 		public static Sampler Deserialize(GLTFRoot root, JsonReader reader)
 		{
 			var sampler = new Sampler();
-
+			
 			while (reader.Read() && reader.TokenType == JsonToken.PropertyName)
 			{
 				var curProp = reader.Value.ToString();

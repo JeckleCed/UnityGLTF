@@ -2,7 +2,8 @@ using System.Collections;
 using System.IO;
 using UnityEngine;
 
-namespace UnityGLTF {
+namespace UnityGLTF
+{
 
 	/// <summary>
 	/// Component to load a GLTF scene with
@@ -14,9 +15,7 @@ namespace UnityGLTF {
 		public bool UseStream = false;
 
 		public int MaximumLod = 300;
-
-		public Shader GLTFStandard;
-		public Shader GLTFConstant;
+		public GLTFSceneImporter.ColliderType Colliders = GLTFSceneImporter.ColliderType.None;
 
 		IEnumerator Start()
 		{
@@ -24,27 +23,27 @@ namespace UnityGLTF {
 			FileStream gltfStream = null;
 			if (UseStream)
 			{
-				var fullPath = Application.streamingAssetsPath + Url;
+				var fullPath = Path.Combine(Application.streamingAssetsPath, Url);
 				gltfStream = File.OpenRead(fullPath);
 				loader = new GLTFSceneImporter(
 					fullPath,
 					gltfStream,
-					gameObject.transform
+					gameObject.transform,
+                    Colliders
 					);
 			}
 			else
 			{
 				loader = new GLTFSceneImporter(
 					Url,
-					gameObject.transform
+					gameObject.transform,
+                    Colliders
 					);
 			}
 
-			loader.SetShaderForMaterialType(GLTFSceneImporter.MaterialType.PbrMetallicRoughness, GLTFStandard);
-			loader.SetShaderForMaterialType(GLTFSceneImporter.MaterialType.CommonConstant, GLTFConstant);
-			loader.MaximumLod = MaximumLod;
+            loader.MaximumLod = MaximumLod;
 			yield return loader.Load(-1, Multithreaded);
-			if(gltfStream != null)
+			if (gltfStream != null)
 			{
 #if WINDOWS_UWP
 				gltfStream.Dispose();

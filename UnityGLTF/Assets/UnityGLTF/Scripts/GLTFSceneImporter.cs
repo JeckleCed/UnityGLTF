@@ -15,73 +15,68 @@ namespace UnityGLTF
 {
 	public class GLTFSceneImporter
 	{
-		public enum MaterialType
-		{
-			PbrMetallicRoughness,
-			PbrSpecularGlossiness,
-			CommonConstant,
-			CommonPhong,
-			CommonBlinn,
-			CommonLambert
-		}
-
 		private enum LoadType
 		{
 			Uri,
 			Stream
 		}
 
+		public enum ColliderType
+		{
+			None,
+			Box,
+			Mesh
+		}
+
+		protected struct GLBStream
+		{
+			public Stream Stream;
+			public long StartPosition;
+		}
+
 		protected GameObject _lastLoadedScene;
 		protected readonly Transform _sceneParent;
-		protected readonly Dictionary<MaterialType, Shader> _shaderCache = new Dictionary<MaterialType, Shader>();
 		public int MaximumLod = 300;
 		protected readonly GLTF.Schema.Material DefaultMaterial = new GLTF.Schema.Material();
 		protected string _gltfUrl;
 		protected string _gltfDirectoryPath;
-		protected Stream _gltfStream;
+		protected GLBStream _gltfStream;
 		protected GLTFRoot _root;
 		protected AssetCache _assetCache;
 		protected AsyncAction _asyncAction;
-		byte[] _gltfData;
-		LoadType _loadType;
+		protected ColliderType _defaultColliderType = ColliderType.None;
+		private LoadType _loadType;
 
 		/// <summary>
 		/// Creates a GLTFSceneBuilder object which will be able to construct a scene based off a url
 		/// </summary>
 		/// <param name="gltfUrl">URL to load</param>
 		/// <param name="parent"></param>
-		public GLTFSceneImporter(string gltfUrl, Transform parent = null)
+		/// <param name="addColliders">Option to add mesh colliders to primitives</param>
+		public GLTFSceneImporter(string gltfUrl, Transform parent = null, ColliderType DefaultCollider = ColliderType.None)
 		{
 			_gltfUrl = gltfUrl;
 			_gltfDirectoryPath = AbsoluteUriPath(gltfUrl);
 			_sceneParent = parent;
 			_asyncAction = new AsyncAction();
 			_loadType = LoadType.Uri;
+			_defaultColliderType = DefaultCollider;
 		}
 
-		public GLTFSceneImporter(string rootPath, Stream stream, Transform parent = null)
+		public GLTFSceneImporter(string rootPath, Stream stream, Transform parent = null, ColliderType DefaultCollider = ColliderType.None)
 		{
 			_gltfUrl = rootPath;
 			_gltfDirectoryPath = AbsoluteFilePath(rootPath);
-			_gltfStream = stream;
+			_gltfStream = new GLBStream {Stream = stream, StartPosition = stream.Position};
 			_sceneParent = parent;
 			_asyncAction = new AsyncAction();
 			_loadType = LoadType.Stream;
+			_defaultColliderType = DefaultCollider;
 		}
 
 		public GameObject LastLoadedScene
 		{
 			get { return _lastLoadedScene; }
-		}
-
-		/// <summary>
-		/// Configures shaders in the shader cache for a given material type
-		/// </summary>
-		/// <param name="type">Material type to setup shader for</param>
-		/// <param name="shader">Shader object to apply</param>
-		public virtual void SetShaderForMaterialType(MaterialType type, Shader shader)
-		{
-			_shaderCache.Add(type, shader);
 		}
 
 		/// <summary>
@@ -103,21 +98,15 @@ namespace UnityGLTF
 					throw new WebRequestException(www);
 				}
 
-				_gltfData = www.downloadHandler.data;
-			}
-			else if (_loadType == LoadType.Stream)
-			{
-				// todo optimization: add stream support to parsing layer
-				int streamLength = (int) _gltfStream.Length;
-				_gltfData = new byte[streamLength];
-				_gltfStream.Read(_gltfData, 0, streamLength);
+				byte[] gltfData = www.downloadHandler.data;
+				_gltfStream.Stream = new MemoryStream(gltfData, 0, gltfData .Length, false, true);
 			}
 			else
 			{
 				throw new Exception("Invalid load type specified: " + _loadType);
 			}
 
-			_root = GLTFParser.ParseJson(_gltfData);
+			_root = GLTFParser.ParseJson(_gltfStream.Stream, _gltfStream.StartPosition);
 			yield return ImportScene(sceneIndex, isMultithreaded);
 		}
 
@@ -166,9 +155,12 @@ namespace UnityGLTF
 						}
 						else //null buffer uri indicates GLB buffer loading
 						{
-							byte[] glbBuffer;
-							GLTFParser.ExtractBinaryChunk(_gltfData, i, out glbBuffer);
-							_assetCache.BufferCache[i] = glbBuffer;
+							GLTFParser.SeekToBinaryChunk(_gltfStream.Stream, i, _gltfStream.StartPosition);
+							_assetCache.BufferCache[i] = new BufferCacheData()
+							{
+								ChunkOffset = _gltfStream.Stream.Position,
+								Stream = _gltfStream.Stream
+							};
 						}
 					}
 				}
@@ -226,10 +218,12 @@ namespace UnityGLTF
 				Dictionary<string, AttributeAccessor> attributeAccessors = new Dictionary<string, AttributeAccessor>(primitive.Attributes.Count + 1);
 				foreach (var attributePair in primitive.Attributes)
 				{
+					BufferCacheData bufferCacheData = _assetCache.BufferCache[attributePair.Value.Value.BufferView.Value.Buffer.Id];
 					AttributeAccessor AttributeAccessor = new AttributeAccessor()
 					{
 						AccessorId = attributePair.Value,
-						Buffer = _assetCache.BufferCache[attributePair.Value.Value.BufferView.Value.Buffer.Id]
+						Stream = bufferCacheData.Stream,
+						Offset = bufferCacheData.ChunkOffset
 					};
 
 					attributeAccessors[attributePair.Key] = AttributeAccessor;
@@ -237,17 +231,54 @@ namespace UnityGLTF
 
 				if (primitive.Indices != null)
 				{
+					BufferCacheData bufferCacheData = _assetCache.BufferCache[primitive.Indices.Value.BufferView.Value.Buffer.Id];
 					AttributeAccessor indexBuilder = new AttributeAccessor()
 					{
 						AccessorId = primitive.Indices,
-						Buffer = _assetCache.BufferCache[primitive.Indices.Value.BufferView.Value.Buffer.Id]
+						Stream = bufferCacheData.Stream,
+						Offset = bufferCacheData.ChunkOffset
 					};
 
 					attributeAccessors[SemanticProperties.INDICES] = indexBuilder;
 				}
 
 				GLTFHelpers.BuildMeshAttributes(ref attributeAccessors);
+				TransformAttributes(ref attributeAccessors);
 				_assetCache.MeshCache[meshID][primitiveIndex].MeshAttributes = attributeAccessors;
+			}
+		}
+
+		protected void TransformAttributes(ref Dictionary<string, AttributeAccessor> attributeAccessors)
+		{
+			// Flip vectors and triangles to the Unity coordinate system.
+			if (attributeAccessors.ContainsKey(SemanticProperties.POSITION))
+			{
+				AttributeAccessor attributeAccessor = attributeAccessors[SemanticProperties.POSITION];
+				SchemaExtensions.ConvertVector3CoordinateSpace(ref attributeAccessor, SchemaExtensions.CoordinateSpaceConversionScale);
+			}
+			if (attributeAccessors.ContainsKey(SemanticProperties.INDICES))
+			{
+				AttributeAccessor attributeAccessor = attributeAccessors[SemanticProperties.INDICES];
+				SchemaExtensions.FlipFaces(ref attributeAccessor);
+			}
+			if (attributeAccessors.ContainsKey(SemanticProperties.NORMAL))
+			{
+				AttributeAccessor attributeAccessor = attributeAccessors[SemanticProperties.NORMAL];
+				SchemaExtensions.ConvertVector3CoordinateSpace(ref attributeAccessor, SchemaExtensions.CoordinateSpaceConversionScale);
+			}
+			// TexCoord goes from 0 to 3 to match GLTFHelpers.BuildMeshAttributes
+			for (int i = 0; i < 4; i++)
+			{
+				if (attributeAccessors.ContainsKey(SemanticProperties.TexCoord(i)))
+				{
+					AttributeAccessor attributeAccessor = attributeAccessors[SemanticProperties.TexCoord(i)];
+					SchemaExtensions.FlipTexCoordArrayV(ref attributeAccessor);
+				}
+			}
+			if (attributeAccessors.ContainsKey(SemanticProperties.TANGENT))
+			{
+				AttributeAccessor attributeAccessor = attributeAccessors[SemanticProperties.TANGENT];
+				SchemaExtensions.ConvertVector4CoordinateSpace(ref attributeAccessor, SchemaExtensions.TangentSpaceConversionScale);
 			}
 		}
 
@@ -341,38 +372,38 @@ namespace UnityGLTF
 				UnityEngine.Mesh mesh = new UnityEngine.Mesh
 				{
 					vertices = primitive.Attributes.ContainsKey(SemanticProperties.POSITION)
-						? meshAttributes[SemanticProperties.POSITION].AccessorContent.AsVertices.ToUnityVector3()
+						? meshAttributes[SemanticProperties.POSITION].AccessorContent.AsVertices.ToUnityVector3Raw()
 						: null,
 					normals = primitive.Attributes.ContainsKey(SemanticProperties.NORMAL)
-						? meshAttributes[SemanticProperties.NORMAL].AccessorContent.AsNormals.ToUnityVector3()
+						? meshAttributes[SemanticProperties.NORMAL].AccessorContent.AsNormals.ToUnityVector3Raw()
 						: null,
 
 					uv = primitive.Attributes.ContainsKey(SemanticProperties.TexCoord(0))
-						? meshAttributes[SemanticProperties.TexCoord(0)].AccessorContent.AsTexcoords.ToUnityVector2()
+						? meshAttributes[SemanticProperties.TexCoord(0)].AccessorContent.AsTexcoords.ToUnityVector2Raw()
 						: null,
 
 					uv2 = primitive.Attributes.ContainsKey(SemanticProperties.TexCoord(1))
-						? meshAttributes[SemanticProperties.TexCoord(1)].AccessorContent.AsTexcoords.ToUnityVector2()
+						? meshAttributes[SemanticProperties.TexCoord(1)].AccessorContent.AsTexcoords.ToUnityVector2Raw()
 						: null,
 
 					uv3 = primitive.Attributes.ContainsKey(SemanticProperties.TexCoord(2))
-						? meshAttributes[SemanticProperties.TexCoord(2)].AccessorContent.AsTexcoords.ToUnityVector2()
+						? meshAttributes[SemanticProperties.TexCoord(2)].AccessorContent.AsTexcoords.ToUnityVector2Raw()
 						: null,
 
 					uv4 = primitive.Attributes.ContainsKey(SemanticProperties.TexCoord(3))
-						? meshAttributes[SemanticProperties.TexCoord(3)].AccessorContent.AsTexcoords.ToUnityVector2()
+						? meshAttributes[SemanticProperties.TexCoord(3)].AccessorContent.AsTexcoords.ToUnityVector2Raw()
 						: null,
 
 					colors = primitive.Attributes.ContainsKey(SemanticProperties.Color(0))
-						? meshAttributes[SemanticProperties.Color(0)].AccessorContent.AsColors.ToUnityColor()
+						? meshAttributes[SemanticProperties.Color(0)].AccessorContent.AsColors.ToUnityColorRaw()
 						: null,
 
 					triangles = primitive.Indices != null
-						? meshAttributes[SemanticProperties.INDICES].AccessorContent.AsTriangles
+						? meshAttributes[SemanticProperties.INDICES].AccessorContent.AsTriangles.ToIntArrayRaw()
 						: MeshPrimitive.GenerateTriangles(vertexCount),
 
 					tangents = primitive.Attributes.ContainsKey(SemanticProperties.TANGENT)
-						? meshAttributes[SemanticProperties.TANGENT].AccessorContent.AsTangents.ToUnityVector4()
+						? meshAttributes[SemanticProperties.TANGENT].AccessorContent.AsTangents.ToUnityVector4Raw()
 						: null
 				};
 
@@ -389,6 +420,19 @@ namespace UnityGLTF
 			var meshRenderer = primitiveObj.AddComponent<MeshRenderer>();
 			meshRenderer.material = materialWrapper.GetContents(primitive.Attributes.ContainsKey(SemanticProperties.Color(0)));
 
+			if (_defaultColliderType == ColliderType.Box)
+			{
+				var boxCollider = primitiveObj.AddComponent<BoxCollider>();
+				boxCollider.center = meshFilter.sharedMesh.bounds.center;
+				boxCollider.size = meshFilter.sharedMesh.bounds.size;
+			}
+			else if (_defaultColliderType == ColliderType.Mesh)
+			{
+				var meshCollider = primitiveObj.AddComponent<MeshCollider>();
+				meshCollider.sharedMesh = meshFilter.sharedMesh;
+				meshCollider.convex = true;
+			}
+
 			return primitiveObj;
 		}
 
@@ -397,155 +441,114 @@ namespace UnityGLTF
 			MaterialCacheData materialWrapper = null;
 			if (materialIndex < 0 || _assetCache.MaterialCache[materialIndex] == null)
 			{
-				Shader shader;
-
-				// get the shader to use for this material
-				try
-				{
-					if (def.PbrMetallicRoughness != null)
-						shader = _shaderCache[MaterialType.PbrMetallicRoughness];
-					else if (_root.ExtensionsUsed != null && _root.ExtensionsUsed.Contains("KHR_materials_common")
-					         && def.CommonConstant != null)
-						shader = _shaderCache[MaterialType.CommonConstant];
-					else
-						shader = _shaderCache[MaterialType.PbrMetallicRoughness];
-				}
-				catch (KeyNotFoundException)
-				{
-					Debug.LogWarningFormat("No shader supplied for type of glTF material {0}, using Standard fallback", def.Name);
-					shader = Shader.Find("Standard");
-				}
-
-				shader.maximumLOD = MaximumLod;
-
-				var material = new UnityEngine.Material(shader);
-
-				if (def.AlphaMode == AlphaMode.MASK)
-				{
-					material.SetOverrideTag("RenderType", "TransparentCutout");
-					material.SetInt("_SrcBlend", (int) UnityEngine.Rendering.BlendMode.One);
-					material.SetInt("_DstBlend", (int) UnityEngine.Rendering.BlendMode.Zero);
-					material.SetInt("_ZWrite", 1);
-					material.EnableKeyword("_ALPHATEST_ON");
-					material.DisableKeyword("_ALPHABLEND_ON");
-					material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-					material.renderQueue = (int) UnityEngine.Rendering.RenderQueue.AlphaTest;
-					material.SetFloat("_Cutoff", (float) def.AlphaCutoff);
-				}
-				else if (def.AlphaMode == AlphaMode.BLEND)
-				{
-					material.SetOverrideTag("RenderType", "Transparent");
-					material.SetInt("_SrcBlend", (int) UnityEngine.Rendering.BlendMode.SrcAlpha);
-					material.SetInt("_DstBlend", (int) UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
-					material.SetInt("_ZWrite", 0);
-					material.DisableKeyword("_ALPHATEST_ON");
-					material.EnableKeyword("_ALPHABLEND_ON");
-					material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-					material.renderQueue = (int) UnityEngine.Rendering.RenderQueue.Transparent;
-				}
+				IUniformMap mapper;
+				const string specGlossExtName = KHR_materials_pbrSpecularGlossinessExtensionFactory.EXTENSION_NAME;
+				if (_root.ExtensionsUsed != null && _root.ExtensionsUsed.Contains(specGlossExtName)
+					&& def.Extensions != null && def.Extensions.ContainsKey(specGlossExtName))
+					mapper = new SpecGlossMap(MaximumLod);
 				else
-				{
-					material.SetOverrideTag("RenderType", "Opaque");
-					material.SetInt("_SrcBlend", (int) UnityEngine.Rendering.BlendMode.One);
-					material.SetInt("_DstBlend", (int) UnityEngine.Rendering.BlendMode.Zero);
-					material.SetInt("_ZWrite", 1);
-					material.DisableKeyword("_ALPHATEST_ON");
-					material.DisableKeyword("_ALPHABLEND_ON");
-					material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-					material.renderQueue = -1;
-				}
+					mapper = new MetalRoughMap(MaximumLod);
 
-				if (def.DoubleSided)
-				{
-					material.SetInt("_Cull", (int) CullMode.Off);
-				}
-				else
-				{
-					material.SetInt("_Cull", (int) CullMode.Back);
-				}
+				mapper.AlphaMode = def.AlphaMode;
+				mapper.DoubleSided = def.DoubleSided;
 
-				if (def.PbrMetallicRoughness != null)
+				var mrMapper = mapper as IMetalRoughUniformMap;
+				if (def.PbrMetallicRoughness != null && mrMapper != null)
 				{
 					var pbr = def.PbrMetallicRoughness;
 
-					material.SetColor("_Color", pbr.BaseColorFactor.ToUnityColor());
+					mrMapper.BaseColorFactor = pbr.BaseColorFactor.ToUnityColorRaw();
 
 					if (pbr.BaseColorTexture != null)
 					{
-						var texture = pbr.BaseColorTexture.Index.Value;
-						material.SetTexture("_MainTex", CreateTexture(texture));
+						var textureDef = pbr.BaseColorTexture.Index.Value;
+						mrMapper.BaseColorTexture = CreateTexture(textureDef);
+						mrMapper.BaseColorTexCoord = pbr.BaseColorTexture.TexCoord;
+
+						//ApplyTextureTransform(pbr.BaseColorTexture, material, "_MainTex");
 					}
 
-					material.SetFloat("_Metallic", (float) pbr.MetallicFactor);
+					mrMapper.MetallicFactor = pbr.MetallicFactor;
 
 					if (pbr.MetallicRoughnessTexture != null)
 					{
 						var texture = pbr.MetallicRoughnessTexture.Index.Value;
-						material.SetTexture("_MetallicRoughnessMap", CreateTexture(texture));
+						mrMapper.MetallicRoughnessTexture = CreateTexture(texture);
+						mrMapper.MetallicRoughnessTexCoord = pbr.MetallicRoughnessTexture.TexCoord;
+
+						//ApplyTextureTransform(pbr.MetallicRoughnessTexture, material, "_MetallicRoughnessMap");
 					}
 
-					material.SetFloat("_Roughness", (float) pbr.RoughnessFactor);
+					mrMapper.RoughnessFactor = pbr.RoughnessFactor;
 				}
 
-				if (def.CommonConstant != null)
+				var sgMapper = mapper as ISpecGlossUniformMap;
+				if (sgMapper != null)
 				{
-					material.SetColor("_AmbientFactor", def.CommonConstant.AmbientFactor.ToUnityColor());
+					var specGloss = def.Extensions[specGlossExtName] as KHR_materials_pbrSpecularGlossinessExtension;
+					
+					sgMapper.DiffuseFactor = specGloss.DiffuseFactor.ToUnityColorRaw();
 
-					if (def.CommonConstant.LightmapTexture != null)
+					if (specGloss.DiffuseTexture != null)
 					{
-						material.EnableKeyword("LIGHTMAP_ON");
+						var texture = specGloss.DiffuseTexture.Index.Value;
+						sgMapper.DiffuseTexture = CreateTexture(texture);
+						sgMapper.DiffuseTexCoord = specGloss.DiffuseTexture.TexCoord;
 
-						var texture = def.CommonConstant.LightmapTexture.Index.Value;
-						material.SetTexture("_LightMap", CreateTexture(texture));
-						material.SetInt("_LightUV", def.CommonConstant.LightmapTexture.TexCoord);
+						//ApplyTextureTransform(specGloss.DiffuseTexture, material, "_MainTex");
 					}
 
-					material.SetColor("_LightFactor", def.CommonConstant.LightmapFactor.ToUnityColor());
+					sgMapper.SpecularFactor = specGloss.SpecularFactor.ToUnityVector3Raw();
+					sgMapper.GlossinessFactor = specGloss.GlossinessFactor;
+
+					if (specGloss.SpecularGlossinessTexture != null)
+					{
+						var texture = specGloss.SpecularGlossinessTexture.Index.Value;
+						sgMapper.SpecularGlossinessTexture = CreateTexture(texture);
+
+						//ApplyTextureTransform(specGloss.SpecularGlossinessTexture, material, "_SpecGlossMap");
+					}
 				}
 
 				if (def.NormalTexture != null)
 				{
 					var texture = def.NormalTexture.Index.Value;
-					material.SetTexture("_BumpMap", CreateTexture(texture));
-					material.SetFloat("_BumpScale", (float) def.NormalTexture.Scale);
+					mapper.NormalTexture = CreateTexture(texture);
+					mapper.NormalTexCoord = def.NormalTexture.TexCoord;
+					mapper.NormalTexScale = def.NormalTexture.Scale;
+
+					//ApplyTextureTransform(def.NormalTexture, material, "_BumpMap");
 				}
 
 				if (def.OcclusionTexture != null)
 				{
+					mapper.OcclusionTexStrength = def.OcclusionTexture.Strength;
 					var texture = def.OcclusionTexture.Index;
+					mapper.OcclusionTexture = CreateTexture(texture.Value);
 
-					material.SetFloat("_OcclusionStrength", (float) def.OcclusionTexture.Strength);
-
-					if (def.PbrMetallicRoughness != null
-					    && def.PbrMetallicRoughness.MetallicRoughnessTexture != null
-					    && def.PbrMetallicRoughness.MetallicRoughnessTexture.Index.Id == texture.Id)
-					{
-						material.EnableKeyword("OCC_METAL_ROUGH_ON");
-					}
-					else
-					{
-						material.SetTexture("_OcclusionMap", CreateTexture(texture.Value));
-					}
+					//ApplyTextureTransform(def.OcclusionTexture, material, "_OcclusionMap");
 				}
 
 				if (def.EmissiveTexture != null)
 				{
 					var texture = def.EmissiveTexture.Index.Value;
-					material.EnableKeyword("EMISSION_MAP_ON");
-					material.SetTexture("_EmissionMap", CreateTexture(texture));
-					material.SetInt("_EmissionUV", def.EmissiveTexture.TexCoord);
+					mapper.EmissiveTexture = CreateTexture(texture);
+					mapper.EmissiveTexCoord = def.EmissiveTexture.TexCoord;
+
+					//ApplyTextureTransform(def.EmissiveTexture, material, "_EmissionMap");
 				}
 
-				material.SetColor("_EmissionColor", def.EmissiveFactor.ToUnityColor());
+				mapper.EmissiveFactor = def.EmissiveFactor.ToUnityColorRaw();
+
+				var vertColorMapper = mapper.Clone();
+				vertColorMapper.VertexColorsEnabled = true;
 
 				materialWrapper = new MaterialCacheData
 				{
-					UnityMaterial = material,
-					UnityMaterialWithVertexColor = new UnityEngine.Material(material),
+					UnityMaterial = mapper.Material,
+					UnityMaterialWithVertexColor = vertColorMapper.Material,
 					GLTFMaterial = def
 				};
-
-				materialWrapper.UnityMaterialWithVertexColor.EnableKeyword("VERTEX_COLOR_ON");
 
 				if (materialIndex > 0)
 				{
@@ -604,6 +607,24 @@ namespace UnityGLTF
 			}
 
 			return _assetCache.TextureCache[texture.Source.Id];
+		}
+
+		protected virtual void ApplyTextureTransform(TextureInfo def, UnityEngine.Material mat, string texName)
+		{
+			IExtension extension;
+			if (_root.ExtensionsUsed != null &&
+				_root.ExtensionsUsed.Contains(ExtTextureTransformExtensionFactory.EXTENSION_NAME) &&
+				def.Extensions != null &&
+				def.Extensions.TryGetValue(ExtTextureTransformExtensionFactory.EXTENSION_NAME, out extension))
+			{
+				ExtTextureTransformExtension ext = (ExtTextureTransformExtension)extension;
+
+				Vector2 temp = ext.Offset.ToUnityVector2Raw();
+				temp = new Vector2(temp.x, -temp.y);
+				mat.SetTextureOffset(texName, temp);
+
+				mat.SetTextureScale(texName, ext.Scale.ToUnityVector2Raw());
+			}
 		}
 
 		protected const string Base64StringInitializer = "^data:[a-z-]+/[a-z-]+;base64,";
@@ -666,11 +687,11 @@ namespace UnityGLTF
 				{
 					texture = new Texture2D(0, 0);
 					var bufferView = image.BufferView.Value;
-					var buffer = bufferView.Buffer.Value;
 					var data = new byte[bufferView.ByteLength];
 
 					var bufferContents = _assetCache.BufferCache[bufferView.Buffer.Id];
-					System.Buffer.BlockCopy(bufferContents, bufferView.ByteOffset, data, 0, data.Length);
+					bufferContents.Stream.Position = bufferView.ByteOffset + bufferContents.ChunkOffset;
+					bufferContents.Stream.Read(data, 0, data.Length);
 					texture.LoadImage(data);
 				}
 
@@ -685,15 +706,16 @@ namespace UnityGLTF
 		{
 			if (buffer.Uri != null)
 			{
-				byte[] bufferData = null;
+				Stream bufferStream = null;
 				var uri = buffer.Uri;
 
 				Regex regex = new Regex(Base64StringInitializer);
 				Match match = regex.Match(uri);
 				if (match.Success)
 				{
-					var base64Data = uri.Substring(match.Length);
-					bufferData = Convert.FromBase64String(base64Data);
+					string base64String = uri.Substring(match.Length);
+					byte[] base64ByteData = Convert.FromBase64String(base64String);
+					bufferStream = new MemoryStream(base64ByteData, 0, base64ByteData.Length, false, true);
 				}
 				else if (_loadType == LoadType.Uri)
 				{
@@ -701,22 +723,18 @@ namespace UnityGLTF
 
 					yield return www.Send();
 
-					bufferData = www.downloadHandler.data;
+					bufferStream = new MemoryStream(www.downloadHandler.data, 0, www.downloadHandler.data.Length, false, true);
 				}
 				else if (_loadType == LoadType.Stream)
 				{
 					var pathToLoad = Path.Combine(sourceUri, uri);
-					var file = File.OpenRead(pathToLoad);
-					bufferData = new byte[buffer.ByteLength];
-					file.Read(bufferData, 0, buffer.ByteLength);
-#if !WINDOWS_UWP
-					file.Close();
-#else
-					file.Dispose();
-#endif
+					bufferStream = File.OpenRead(pathToLoad);
 				}
 
-				_assetCache.BufferCache[bufferIndex] = bufferData;
+				_assetCache.BufferCache[bufferIndex] = new BufferCacheData()
+				{
+					Stream = bufferStream
+				};
 			}
 		}
 
@@ -728,7 +746,7 @@ namespace UnityGLTF
 		protected static string AbsoluteUriPath(string gltfPath)
 		{
 			var uri = new Uri(gltfPath);
-			var partialPath = uri.AbsoluteUri.Remove(uri.AbsoluteUri.Length - uri.Segments[uri.Segments.Length - 1].Length);
+			var partialPath = uri.AbsoluteUri.Remove(uri.AbsoluteUri.Length - uri.Query.Length - uri.Segments[uri.Segments.Length - 1].Length);
 			return partialPath;
 		}
 
